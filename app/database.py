@@ -2,6 +2,13 @@
 
 设计上只追加（append-only）：revisions / attribution_segments 两张表均不做
 UPDATE/DELETE，任一历史修订的可见数据因此永久不变。
+
+事务边界全部显式管理（``isolation_level=None`` 即 SQLite autocommit 模式）：
+
+- 写路径（补录提交、恢复切换）使用 ``BEGIN IMMEDIATE``；
+- 读路径使用 ``BEGIN`` 开启延迟读事务，把 WAL 快照固定到整次请求结束，
+  因此恢复切换提交的瞬间，进行中的查询要么全程读旧快照、要么全程读新快照，
+  单次请求不会读到新旧混合的数据。
 """
 from __future__ import annotations
 
@@ -19,16 +26,22 @@ def get_db_path() -> Path:
     return Path(os.environ.get("ATTRIBUTION_DB_PATH", str(DEFAULT_DB_PATH)))
 
 
-def _connect(db_path: Path) -> sqlite3.Connection:
+def _connect(db_path: Path, *, uri: str | None = None, readonly: bool = False) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    target = uri if uri is not None else str(db_path)
     conn = sqlite3.connect(
-        str(db_path),
+        target,
         timeout=30.0,
         detect_types=sqlite3.PARSE_DECLTYPES,
+        # 关闭 Python 层隐式事务，事务语句全部由业务代码显式发出。
+        isolation_level=None,
+        uri=uri is not None,
     )
     conn.row_factory = sqlite3.Row
     # WAL 提升读写并发；外键约束开启。
-    conn.execute("PRAGMA journal_mode=WAL")
+    # 只读连接不能修改 journal_mode（会触发写操作），仅保留 busy_timeout。
+    if not readonly:
+        conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=30000")
     return conn
@@ -36,16 +49,41 @@ def _connect(db_path: Path) -> sqlite3.Connection:
 
 @contextmanager
 def get_conn() -> Iterator[sqlite3.Connection]:
-    """请求级连接：正常结束提交，异常回滚并关闭。"""
+    """请求级连接：调用方自行管理显式事务；退出时关闭连接。"""
     conn = _connect(get_db_path())
     try:
         yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
     finally:
         conn.close()
+
+
+@contextmanager
+def open_readonly(path: Path) -> Iterator[sqlite3.Connection]:
+    """以只读 URI 打开一个不受信任的 SQLite 文件（备份校验专用）。
+
+    mode=ro 保证任何语句都无法写入该文件；trusted_schema=OFF 禁止加载
+    文件内可能携带的恶意 schema 触发器/视图逻辑。
+    """
+    conn = _connect(
+        path,
+        uri=f"file:{path.as_posix()}?mode=ro",
+        readonly=True,
+    )
+    try:
+        conn.execute("PRAGMA trusted_schema=OFF")
+        yield conn
+    finally:
+        conn.close()
+
+
+@contextmanager
+def snapshot(conn: sqlite3.Connection) -> Iterator[None]:
+    """固定一次读请求的 WAL 快照：BEGIN 与 COMMIT 之间所有 SELECT 同属一个读事务。"""
+    conn.execute("BEGIN")
+    try:
+        yield
+    finally:
+        conn.execute("COMMIT")
 
 
 SCHEMA_SQL = """
@@ -76,6 +114,10 @@ CREATE INDEX IF NOT EXISTS idx_segments_revision
 
 
 def init_db() -> None:
-    """创建表与索引（幂等）。"""
+    """创建表与索引（幂等）。
+
+    SCHEMA_SQL 全部为 CREATE ... IF NOT EXISTS，语句本身幂等；
+    注意 ``executescript`` 会隐式提交当前事务，故不额外包裹 BEGIN。
+    """
     with get_conn() as conn:
         conn.executescript(SCHEMA_SQL)

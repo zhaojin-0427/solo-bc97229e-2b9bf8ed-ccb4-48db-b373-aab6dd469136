@@ -5,7 +5,5 @@ __pycache__
 *.pyc
 data/
 tests/
-scripts/
-README.md
 .venv
 venv

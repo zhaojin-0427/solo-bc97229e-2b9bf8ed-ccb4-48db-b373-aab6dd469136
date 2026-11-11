@@ -12,8 +12,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY scripts ./scripts
 
-# SQLite 数据文件放在挂载卷中，容器重建不丢数据
+# SQLite 数据文件与恢复暂存区放在挂载卷中，容器重建不丢数据
 RUN mkdir -p /data
 VOLUME ["/data"]
 

@@ -4,8 +4,9 @@ from __future__ import annotations
 from collections import defaultdict
 from sqlite3 import Connection
 
-from .database import get_conn
+from .database import get_conn, snapshot
 from .errors import AppError
+from .recovery import write_lock
 from .schemas import AttributionQueryRequest, AttributionResult, RevisionSubmitRequest, SegmentIn
 
 
@@ -61,39 +62,52 @@ def submit_revision(req: RevisionSubmitRequest) -> dict:
 
     修订号分配与区间插入在同一个 BEGIN IMMEDIATE 事务内完成：
     校验失败/插入失败都会回滚，修订号与数据均保持不变。
+
+    全局写锁与恢复切换互斥：恢复准备后的指纹校验期间不会有补录穿插，
+    反之恢复切换期间补录请求会等待并在切换完成后基于新库继续。
     """
     validate_batch(req.entries)
 
-    with get_conn() as conn:
-        # 立即拿写锁，避免两个并发批次同时分配到同一个修订号。
-        conn.execute("BEGIN IMMEDIATE")
-        cur = conn.execute(
-            "INSERT INTO revisions (entry_count, note) VALUES (?, ?)",
-            (len(req.entries), req.note),
-        )
-        revision_id = cur.lastrowid
-        conn.executemany(
-            """
-            INSERT INTO attribution_segments
-                (revision_id, employee_id, cost_center, effective_from, effective_to)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    revision_id,
-                    e.employee_id,
-                    e.cost_center,
-                    e.effective_from.isoformat(),
-                    e.effective_to.isoformat(),
+    with write_lock:
+        with get_conn() as conn:
+            # 立即拿写锁，避免两个并发批次同时分配到同一个修订号。
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = conn.execute(
+                    "INSERT INTO revisions (entry_count, note) VALUES (?, ?)",
+                    (len(req.entries), req.note),
                 )
-                for e in req.entries
-            ],
-        )
-        row = conn.execute(
-            "SELECT revision_id, entry_count, note, created_at FROM revisions WHERE revision_id = ?",
-            (revision_id,),
-        ).fetchone()
-    return dict(row)
+                revision_id = cur.lastrowid
+                conn.executemany(
+                    """
+                    INSERT INTO attribution_segments
+                        (revision_id, employee_id, cost_center, effective_from, effective_to)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            revision_id,
+                            e.employee_id,
+                            e.cost_center,
+                            e.effective_from.isoformat(),
+                            e.effective_to.isoformat(),
+                        )
+                        for e in req.entries
+                    ],
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+            # 提交后只读回查，独立短事务。
+            with snapshot(conn):
+                row = conn.execute(
+                    "SELECT revision_id, entry_count, note, created_at "
+                    "FROM revisions WHERE revision_id = ?",
+                    (revision_id,),
+                ).fetchone()
+            return dict(row)
 
 
 def _lookup_one(
@@ -123,72 +137,82 @@ def _lookup_one(
 
 
 def attribute_hours(req: AttributionQueryRequest) -> list[AttributionResult]:
-    """逐条返回工时记录在指定修订口径下的成本中心（或未归属）。"""
-    with get_conn() as conn:
-        max_row = conn.execute("SELECT COALESCE(MAX(revision_id), 0) AS r FROM revisions").fetchone()
-        if req.revision_id > max_row["r"]:
-            raise AppError(
-                code="REVISION_NOT_FOUND",
-                message=f"修订号 {req.revision_id} 不存在，当前最大修订号为 {max_row['r']}",
-                status_code=404,
-            )
+    """逐条返回工时记录在指定修订口径下的成本中心（或未归属）。
 
-        results: list[AttributionResult] = []
-        for rec in req.records:
-            cost_center, matched = _lookup_one(
-                conn, req.revision_id, rec.employee_id, rec.work_date.isoformat()
-            )
-            results.append(
-                AttributionResult(
-                    employee_id=rec.employee_id,
-                    work_date=rec.work_date,
-                    hours=rec.hours,
-                    revision_id=req.revision_id,
-                    cost_center=cost_center,
-                    attributed=cost_center is not None,
-                    matched_revision_id=matched,
+    整次查询在同一个读事务（WAL 快照）内完成：若恢复切换在查询期间提交，
+    本查询要么全程读恢复前快照、要么在新快照上执行，不会读到新旧混合数据。
+    """
+    with get_conn() as conn:
+        with snapshot(conn):
+            max_row = conn.execute(
+                "SELECT COALESCE(MAX(revision_id), 0) AS r FROM revisions"
+            ).fetchone()
+            if req.revision_id > max_row["r"]:
+                raise AppError(
+                    code="REVISION_NOT_FOUND",
+                    message=f"修订号 {req.revision_id} 不存在，当前最大修订号为 {max_row['r']}",
+                    status_code=404,
                 )
-            )
+
+            results: list[AttributionResult] = []
+            for rec in req.records:
+                cost_center, matched = _lookup_one(
+                    conn, req.revision_id, rec.employee_id, rec.work_date.isoformat()
+                )
+                results.append(
+                    AttributionResult(
+                        employee_id=rec.employee_id,
+                        work_date=rec.work_date,
+                        hours=rec.hours,
+                        revision_id=req.revision_id,
+                        cost_center=cost_center,
+                        attributed=cost_center is not None,
+                        matched_revision_id=matched,
+                    )
+                )
     return results
 
 
 def list_revisions() -> list[dict]:
     with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT revision_id, entry_count, note, created_at FROM revisions ORDER BY revision_id"
-        ).fetchall()
+        with snapshot(conn):
+            rows = conn.execute(
+                "SELECT revision_id, entry_count, note, created_at "
+                "FROM revisions ORDER BY revision_id"
+            ).fetchall()
     return [dict(r) for r in rows]
 
 
 def list_segments(revision_id: int, employee_id: str | None) -> list[dict]:
     with get_conn() as conn:
-        exists = conn.execute(
-            "SELECT 1 FROM revisions WHERE revision_id = ?", (revision_id,)
-        ).fetchone()
-        if exists is None:
-            raise AppError(
-                code="REVISION_NOT_FOUND",
-                message=f"修订号 {revision_id} 不存在",
-                status_code=404,
-            )
-        if employee_id:
-            rows = conn.execute(
-                """
-                SELECT revision_id, employee_id, cost_center, effective_from, effective_to
-                FROM attribution_segments
-                WHERE revision_id = ? AND employee_id = ?
-                ORDER BY employee_id, effective_from
-                """,
-                (revision_id, employee_id.strip()),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """
-                SELECT revision_id, employee_id, cost_center, effective_from, effective_to
-                FROM attribution_segments
-                WHERE revision_id = ?
-                ORDER BY employee_id, effective_from
-                """,
-                (revision_id,),
-            ).fetchall()
+        with snapshot(conn):
+            exists = conn.execute(
+                "SELECT 1 FROM revisions WHERE revision_id = ?", (revision_id,)
+            ).fetchone()
+            if exists is None:
+                raise AppError(
+                    code="REVISION_NOT_FOUND",
+                    message=f"修订号 {revision_id} 不存在",
+                    status_code=404,
+                )
+            if employee_id:
+                rows = conn.execute(
+                    """
+                    SELECT revision_id, employee_id, cost_center, effective_from, effective_to
+                    FROM attribution_segments
+                    WHERE revision_id = ? AND employee_id = ?
+                    ORDER BY employee_id, effective_from
+                    """,
+                    (revision_id, employee_id.strip()),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT revision_id, employee_id, cost_center, effective_from, effective_to
+                    FROM attribution_segments
+                    WHERE revision_id = ?
+                    ORDER BY employee_id, effective_from
+                    """,
+                    (revision_id,),
+                ).fetchall()
     return [dict(r) for r in rows]
