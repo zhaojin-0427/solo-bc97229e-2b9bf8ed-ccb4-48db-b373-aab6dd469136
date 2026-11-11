@@ -1,0 +1,21 @@
+services:
+  attribution-api:
+    build: .
+    image: attribution-api:latest
+    container_name: attribution-api
+    ports:
+      - "8000:8000"
+    environment:
+      # SQLite 文件落在命名卷，容器重建后修订历史仍在
+      ATTRIBUTION_DB_PATH: /data/attribution.db
+    volumes:
+      - attribution-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=2).status == 200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  attribution-data:
